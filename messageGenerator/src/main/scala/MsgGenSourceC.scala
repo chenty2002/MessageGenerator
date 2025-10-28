@@ -26,7 +26,7 @@ class MsgGenSourceC(edge: TLEdgeOut, blockBytes: Int, beatBytes: Int) extends Mo
 
   val active = RegInit(false.B)
   val beatIdx = RegInit(0.U(beatIdxBits.W))
-  val reqReg = RegInit(0.U.asTypeOf(new MsgGenReleaseReq(edge, blockBytes)))
+  val reqReg = Reg(new MsgGenReleaseReq(edge, blockBytes))
 
   io.req.ready := !active
 
