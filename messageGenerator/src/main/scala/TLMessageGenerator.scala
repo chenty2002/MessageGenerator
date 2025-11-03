@@ -76,25 +76,20 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
     val sourceIdVec = VecInit((0 until numSources).map(i => (params.sourceIdRange.start + i).U(edge.bundle.sourceBits.W)))
     val defaultSourceId = params.sourceIdRange.start.U(edge.bundle.sourceBits.W)
 
-    private val releaseSourceC = Module(new MsgGenSourceC(edge, blockBytes, beatBytes))
+    private val releaseSourceC = Module(new MsgGenSourceC(edge, blockBytes, beatBytes, entries = 8))
     releaseSourceC.io.source := defaultSourceId
 
     def addrIndex(a: UInt) = (a >> offBits)(idxBits-1,0)
     def addrTag(a: UInt)   = (a >> (offBits + idxBits))(tagBits-1,0)
     def lineBase(a: UInt)  = Cat(a(edge.bundle.addressBits-1, offBits), 0.U(offBits.W))
 
+    // 目录状态枚举
+    val stateN :: stateB :: stateT :: Nil = Enum(3)
+    
     val dir_valid = RegInit(VecInit(Seq.fill(lines)(false.B)))
     val dir_tag   = Reg(Vec(lines, UInt(tagBits.W)))
-    val dir_state = RegInit(VecInit(Seq.fill(lines)(0.U(2.W))))  // 0=N, 1=B, 2=T
+    val dir_state = RegInit(VecInit(Seq.fill(lines)(stateN)))  // N=None, B=Branch, T=Trunk
     val dir_data  = Reg(Vec(lines, UInt(blockBits.W)))
-
-    // ProbeAck多拍发送状态
-    val multiBeatLine = lineBeats > 1
-    val probeActive       = RegInit(false.B)
-    val probeBeatIdx      = RegInit(0.U(beatCountBits.W))
-    val probeStoredData   = RegInit(0.U(blockBits.W))
-    val probeStoredBase   = RegInit(0.U(edge.bundle.addressBits.W))
-    val probeStoredHitIdx = RegInit(0.U(idxBits.W))
 
     // Acquire请求追踪
     val entryIdle :: entrySendAcquire :: entryWaitGrant :: entryGrantAck :: Nil = Enum(4)
@@ -109,7 +104,7 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
     val entryGrantSink = if (edge.bundle.sinkBits > 0) Some(RegInit(VecInit(Seq.fill(numSources)(0.U(edge.bundle.sinkBits.W))))) else None
 
     
-    private val releaseReqReg   = Reg(new MsgGenReleaseReq(edge, blockBytes))
+    private val releaseReqReg   = Reg(new MsgGenSourceCReq(edge, blockBytes))
     val releaseReqValid = RegInit(false.B)
 
     // Release状态机
@@ -140,8 +135,9 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
 
     // Release请求命中则加入队列
     when (takeRelease && takeLineHit && releaseState === releaseIdle) {
-      releaseReqReg.address := lineBase(io.in_addr)
+      releaseReqReg.opcode  := TLMessages.ReleaseData
       releaseReqReg.param   := Mux(io.in_param, TLPermissions.TtoB, TLPermissions.TtoN)
+      releaseReqReg.address := lineBase(io.in_addr)
       releaseReqReg.data    := dir_data(takeAddrIndex)
       releaseReqValid       := true.B
       releaseState := releaseEnqueue
@@ -157,25 +153,59 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
     val hasAcquireToSend = sendAcquireMask.orR
     val acquireIndex = OHToUInt(sendAcquireSel)
 
-    // B channel ready logic: block only if currently sending multi-beat ProbeAck for the same set/tag
-    val incomingProbeIdx = addrIndex(out.b.bits.address)
-    val incomingProbeTag = addrTag(out.b.bits.address)
-    val probeConflict = probeActive && (incomingProbeIdx === probeStoredHitIdx)
-    out.b.ready := !probeConflict
+    // B channel ready logic: no backpressure from ProbeAck queue
+    out.b.ready := true.B
     out.d.ready := true.B
 
-    // B通道发送ProbeAck
+    // B通道接收Probe并发送ProbeAck
     val probeHitIndex = addrIndex(out.b.bits.address)
     val probeHitTag   = addrTag(out.b.bits.address)
     val probeHit      = dir_valid(probeHitIndex) && dir_tag(probeHitIndex) === probeHitTag
     val probeData     = dir_data(probeHitIndex)
     val probeState    = dir_state(probeHitIndex)
     val probeBaseAddr = lineBase(out.b.bits.address)
-    val sendingProbeAck = out.b.valid && out.b.ready && probeHit
+    val probeParam    = out.b.bits.param
+
+    // Calculate ProbeAck opcode: ProbeAck or ProbeAckData
+    val needProbeAckData = probeHit && probeState === stateT
+    val probeAckOpcode = Mux(needProbeAckData, TLMessages.ProbeAckData, TLMessages.ProbeAck)
+
+    // Calculate ProbeAck param based on current state and probe param
+    val probeAckParam = Mux(!probeHit, TLPermissions.NtoN,
+      MuxLookup(Cat(probeParam, probeState), TLPermissions.BtoB)(Seq(
+        Cat(TLPermissions.toN, stateB) -> TLPermissions.BtoN,  // B→N
+        Cat(TLPermissions.toN, stateT) -> TLPermissions.TtoN,  // T→N
+        Cat(TLPermissions.toB, stateT) -> TLPermissions.TtoB,  // T→B
+        Cat(TLPermissions.toB, stateB) -> TLPermissions.BtoB   // B→B (no change)
+      ))
+    )
+
+    // Enqueue ProbeAck request to SourceC
+    val probeAckReq = Wire(new MsgGenSourceCReq(edge, blockBytes))
+    probeAckReq.opcode  := probeAckOpcode
+    probeAckReq.param   := probeAckParam
+    probeAckReq.address := probeBaseAddr
+    probeAckReq.data    := Mux(needProbeAckData, probeData, 0.U)
+
+    // ProbeAck has higher priority than Release, directly connect to SourceC
+    val probeAckValid = out.b.valid && out.b.ready
+    
+    when (out.b.fire) {
+      // Update directory state based on probe param
+      when (probeHit) {
+        when (probeParam === TLPermissions.toN) {
+          dir_valid(probeHitIndex) := false.B
+          dir_state(probeHitIndex) := stateN
+        }.elsewhen (probeParam === TLPermissions.toB && probeState === stateT) {
+          dir_state(probeHitIndex) := stateB
+        }
+        // toB on stateB or toT on stateT: no state change
+      }
+    }
 
     // A channel: Acquire requests
     // Similar to CoupledL2 AcquireUnit: straightforward valid/ready assignment
-    val allowAcquire = hasAcquireToSend && !sendingProbeAck && !probeActive
+    val allowAcquire = hasAcquireToSend && !probeAckValid
     val aBitsWire = Wire(out.a.bits.cloneType)
     aBitsWire := 0.U.asTypeOf(out.a.bits)
     when (hasAcquireToSend) {
@@ -192,85 +222,21 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
 
     // C channel: ProbeAck (priority) vs Release
     // Similar to CoupledL2 SourceC: handle multi-source output with proper arbitration
-    val sourceCOut = releaseSourceC.io.tlc
-    val cBitsWire = Wire(out.c.bits.cloneType)
-    cBitsWire := sourceCOut.bits
-    val cValidWire = WireInit(sourceCOut.valid)
-    val sourceCReady = WireInit(out.c.ready && !sendingProbeAck && !probeActive)
+    val sourceCReqValid = Mux(probeAckValid, true.B, releaseState === releaseEnqueue && releaseReqValid)
+    val sourceCReqBits = Mux(probeAckValid, probeAckReq, releaseReqReg)
 
-    def mkProbeAckBundle(addr: UInt, data: UInt) = {
-      val bundle = WireDefault(0.U.asTypeOf(out.c.bits))
-      bundle.opcode := TLMessages.ProbeAckData
-      bundle.param  := 0.U
-      bundle.source := defaultSourceId
-      bundle.address:= addr
-      bundle.size   := log2Ceil(blockBytes).U
-      bundle.data   := data
-      bundle.corrupt:= false.B
-      bundle
-    }
+    releaseSourceC.io.req.valid := sourceCReqValid
+    releaseSourceC.io.req.bits  := sourceCReqBits
+    
+    out.c <> releaseSourceC.io.tlc
 
-    // ProbeAck has higher priority than Release
-    when (sendingProbeAck) {
-      val probeVec = probeData.asTypeOf(Vec(lineBeats, UInt(beatBits.W)))
-      val firstBeat = probeVec.head
-      cBitsWire := mkProbeAckBundle(probeBaseAddr, firstBeat)
-      cValidWire := true.B
-      sourceCReady := false.B
-      when (out.c.fire) {
-        when (probeState === 2.U) { dir_state(probeHitIndex) := 1.U }  // T→B降级
-        if (multiBeatLine) {
-          probeActive := true.B
-          probeBeatIdx := 1.U
-          probeStoredData := probeData
-          probeStoredBase := probeBaseAddr
-          probeStoredHitIdx := probeHitIndex
-        } else {
-          probeActive := false.B
-          probeBeatIdx := 0.U
-        }
-      }
-    }
-
-    // 多beat ProbeAck的后续发送
-    if (multiBeatLine) {
-      val storedVec = probeStoredData.asTypeOf(Vec(lineBeats, UInt(beatBits.W)))
-      when (probeActive && !sendingProbeAck) {
-        val beatData = storedVec(probeBeatIdx)
-        val beatAddr = probeStoredBase + (probeBeatIdx << beatAddrShift).asUInt
-        cBitsWire := mkProbeAckBundle(beatAddr, beatData)
-        cValidWire := true.B
-        sourceCReady := false.B
-        when (out.c.fire) {
-          val lastBeat = probeBeatIdx === (lineBeats - 1).U
-          when (lastBeat) {
-            probeActive := false.B
-            probeBeatIdx := 0.U
-          }.otherwise {
-            probeBeatIdx := probeBeatIdx + 1.U
-          }
-        }
-      }
-    } else {
-      when (!sendingProbeAck) {
-        probeActive := false.B
-        probeBeatIdx := 0.U
-      }
-    }
-
-    sourceCOut.ready := sourceCReady
-    out.c.valid := cValidWire
-    out.c.bits  := cBitsWire
-
-    // Release发送队列
+    // Release发送队列管理
     val releaseIndex = addrIndex(releaseReqReg.address)
-    releaseSourceC.io.req.valid := (releaseState === releaseEnqueue) && releaseReqValid
-    releaseSourceC.io.req.bits  := releaseReqReg
-
-    when (releaseSourceC.io.req.fire) {
+    
+    when (releaseSourceC.io.req.fire && !probeAckValid) {
       releaseReqValid := false.B
       dir_valid(releaseIndex) := false.B
-      dir_state(releaseIndex) := 0.U
+      dir_state(releaseIndex) := stateN
       releaseState := releaseWaitAck
     }
 
@@ -306,9 +272,12 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
           } else {
             Cat(entryGrantBeats(matchedEntry).reverse)
           }
+          // 根据Grant的param更新entryNeedT: toT(0)=true, toB(1)=false
+          val grantedT = out.d.bits.param === TLPermissions.toT
+          entryNeedT(matchedEntry) := grantedT
           dir_valid(lineIdx) := true.B
           dir_tag(lineIdx)   := lineTag
-          dir_state(lineIdx) := Mux(entryNeedT(matchedEntry), 2.U, 1.U)
+          dir_state(lineIdx) := Mux(grantedT, stateT, stateB)
           dir_data(lineIdx)  := fullLine
           entryGrantAccumulating(matchedEntry) := false.B
           entryGrantBeatIdx(matchedEntry) := 0.U
@@ -318,10 +287,13 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
           entryGrantBeatIdx(matchedEntry) := entryGrantBeatIdx(matchedEntry) + 1.U
         }
       }.elsewhen (out.d.bits.opcode === TLMessages.Grant) {
+        // 根据Grant的param更新entryNeedT: toT(0)=true, toB(1)=false
+        val grantedT = out.d.bits.param === TLPermissions.toT
+        entryNeedT(matchedEntry) := grantedT
         // 无数据Grant：目录写入0
         dir_valid(lineIdx) := true.B
         dir_tag(lineIdx)   := lineTag
-        dir_state(lineIdx) := Mux(entryNeedT(matchedEntry), 2.U, 1.U)
+        dir_state(lineIdx) := Mux(grantedT, stateT, stateB)
         dir_data(lineIdx)  := 0.U
         entryState(matchedEntry) := entryGrantAck
         entryGrantAccumulating(matchedEntry) := false.B
@@ -352,7 +324,6 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
     }
 
     when (!out.a.valid) { out.a.bits := 0.U.asTypeOf(out.a.bits) }
-    when (!out.c.valid) { out.c.bits := 0.U.asTypeOf(out.c.bits) }
 
     val io_in_addr      = io.in_addr
     val io_in_isAcquire = io.in_isAcquire

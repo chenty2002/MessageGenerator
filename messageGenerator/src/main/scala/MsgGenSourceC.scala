@@ -6,59 +6,78 @@ import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 
 
-class MsgGenReleaseReq(edge: TLEdgeOut, blockBytes: Int) extends Bundle {
-  val address = UInt(edge.bundle.addressBits.W)
+class MsgGenSourceCReq(edge: TLEdgeOut, blockBytes: Int) extends Bundle {
+  val opcode  = UInt(3.W)  // ProbeAck/ProbeAckData/Release/ReleaseData
   val param   = UInt(3.W)
+  val address = UInt(edge.bundle.addressBits.W)
   val data    = UInt((blockBytes * 8).W)
 }
 
-class MsgGenSourceC(edge: TLEdgeOut, blockBytes: Int, beatBytes: Int) extends Module {
+class MsgGenSourceC(edge: TLEdgeOut, blockBytes: Int, beatBytes: Int, entries: Int = 4) extends Module {
   private val lineBeats     = (blockBytes / beatBytes) max 1
   private val beatBits      = beatBytes * 8
-  private val beatAddrShift = log2Ceil(beatBytes)
-  private val beatIdxBits   = (log2Ceil(lineBeats) max 1)
+  private val beatCountBits = scala.math.max(log2Ceil(lineBeats), 1)
 
   val io = IO(new Bundle {
-    val req    = Flipped(Decoupled(new MsgGenReleaseReq(edge, blockBytes)))
+    val req    = Flipped(Decoupled(new MsgGenSourceCReq(edge, blockBytes)))
     val tlc    = Decoupled(new TLBundleC(edge.bundle))
     val source = Input(UInt(edge.bundle.sourceBits.W))
   })
 
-  val active = RegInit(false.B)
-  val beatIdx = RegInit(0.U(beatIdxBits.W))
-  val reqReg = Reg(new MsgGenReleaseReq(edge, blockBytes))
+  // Queue for tasks and data (similar to CoupledL2 SourceC)
+  val queue = Module(new Queue(new MsgGenSourceCReq(edge, blockBytes), entries = entries, flow = true))
+  queue.io.enq <> io.req
 
-  io.req.ready := !active
+  // Current task being sent
+  val beatValids = RegInit(VecInit(Seq.fill(lineBeats)(false.B)))
+  val taskValid = beatValids.asUInt.orR
+  val taskR = Reg(new MsgGenSourceCReq(edge, blockBytes))
 
-  when(io.req.fire) {
-    reqReg := io.req.bits
-    active := true.B
-    beatIdx := 0.U
+  val dequeueReady = !taskValid
+  queue.io.deq.ready := dequeueReady
+  
+  when(queue.io.deq.valid && dequeueReady) {
+    beatValids.foreach(_ := true.B)
+    taskR := queue.io.deq.bits
   }
 
-  val cBundle = WireDefault(0.U.asTypeOf(new TLBundleC(edge.bundle)))
-  val dataVec = reqReg.data.asTypeOf(Vec(lineBeats, UInt(beatBits.W)))
-  val beatData = dataVec(beatIdx)
-  val addrWithOffset = reqReg.address + (beatIdx << beatAddrShift).asUInt
+  def toTLBundleC(task: MsgGenSourceCReq, data: UInt = 0.U) = {
+    val c = WireDefault(0.U.asTypeOf(new TLBundleC(edge.bundle)))
+    c.opcode := task.opcode
+    c.param := task.param
+    c.size := log2Ceil(blockBytes).U
+    c.source := io.source
+    c.address := task.address  // All beats use same address
+    c.data := data
+    c.corrupt := false.B
+    c
+  }
 
-  cBundle.opcode := TLMessages.ReleaseData
-  cBundle.param  := reqReg.param
-  cBundle.size   := log2Ceil(blockBytes).U
-  cBundle.source := io.source
-  cBundle.address:= addrWithOffset
-  cBundle.data   := beatData
-  cBundle.corrupt:= false.B
+  def getBeat(data: UInt, beatsOH: UInt): (UInt, UInt) = {
+    // Get one beat from data according to beatsOH
+    require(data.getWidth == (blockBytes * 8))
+    require(beatsOH.getWidth == lineBeats)
+    
+    val beatVec = data.asTypeOf(Vec(lineBeats, UInt(beatBits.W)))
+    val next_beat = Mux1H(beatsOH, beatVec)
+    val selOH = PriorityEncoderOH(beatsOH)
+    val next_beatsOH = beatsOH & ~selOH
+    (next_beat, next_beatsOH)
+  }
 
-  io.tlc.valid := active
-  io.tlc.bits  := cBundle
+  val data = taskR.data
+  val beatsOH = beatValids.asUInt
+  val (beat, next_beatsOH) = getBeat(data, beatsOH)
 
-  val lastBeat = beatIdx === (lineBeats - 1).U
+  io.tlc.valid := taskValid
+  io.tlc.bits := toTLBundleC(taskR, beat)
 
-  when(io.tlc.fire) {
-    when(lastBeat) {
-      active := false.B
+  val hasData = io.tlc.bits.opcode(0)
+  when (io.tlc.fire) {
+    when (hasData) {
+      beatValids := VecInit(next_beatsOH.asBools)
     }.otherwise {
-      beatIdx := beatIdx + 1.U
+      beatValids.foreach(_ := false.B)
     }
   }
 }
