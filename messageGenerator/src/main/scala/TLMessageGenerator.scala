@@ -59,6 +59,7 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
       val in_addr       = Input(UInt(edge.bundle.addressBits.W))
       val in_isAcquire  = Input(Bool())  // true=Acquire, false=Release
       val in_param      = Input(Bool())  // Acquire:T/B权限; Release:toB/toN
+      val in_data       = Input(UInt(blockBits.W))  // Release时使用的数据
     })
 
     val lines = params.lines
@@ -138,7 +139,7 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
       releaseReqReg.opcode  := TLMessages.ReleaseData
       releaseReqReg.param   := Mux(io.in_param, TLPermissions.TtoB, TLPermissions.TtoN)
       releaseReqReg.address := lineBase(io.in_addr)
-      releaseReqReg.data    := dir_data(takeAddrIndex)
+      releaseReqReg.data    := io.in_data
       releaseReqValid       := true.B
       releaseState := releaseEnqueue
     }
@@ -328,6 +329,7 @@ class TLMessageGenerator(params: MessageGeneratorParam)(implicit p: Parameters) 
     val io_in_addr      = io.in_addr
     val io_in_isAcquire = io.in_isAcquire
     val io_in_param     = io.in_param
+    val io_in_data      = io.in_data
   }
 
   lazy val module = new TLMessageGeneratorImp(this)
